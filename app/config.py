@@ -35,6 +35,20 @@ class Settings(BaseSettings):
     lexiang_staff_id: str = "system-bot"
     openai_compat_model: str = "lexiang-ai"
 
+    # --- 图片防盗链缓存配置 ---
+    # 是否开启图片缓存（将乐享返回的图片下载到本地并替换 URL）
+    image_cache_enabled: bool = True
+    # 是否缓存 answer / reasoning_content 正文中的图片（可单独关闭）
+    image_cache_answer_enabled: bool = True
+    # 是否缓存 additional_content（如 reference_chunks[].content）中的图片（可单独关闭）
+    image_cache_additional_enabled: bool = True
+    # 图片本地缓存目录
+    image_cache_dir: str = "./cache/images"
+    # 对外暴露的图片服务基础 URL（如 http://your-host:8000/images）
+    image_base_url: str = "http://localhost:8000/images"
+    # 下载图片时伪装的 Referer，绕过防盗链（留空则不发送 Referer）
+    image_referer: str = "https://lexiangla.com"
+
     @property
     def credentials(self) -> list[Credential]:
         """把逗号分隔的凭证配置解析为对象，并校验格式和重复 ID。"""

@@ -11,6 +11,7 @@ from redis.asyncio import Redis
 from .config import Credential, Settings
 from .credentials import CredentialPool
 from .exceptions import GatewayError
+from .image_cache import ImageCache
 from .models import ChatRequest, ChatResponse
 
 QA_URL = "https://lxapi.lexiangla.com/cgi-bin/v1/ai/qa"
@@ -28,12 +29,13 @@ class Conversation:
 class LexiangService:
     """协调会话、凭证池及乐享 AI 问答接口调用的核心服务。"""
 
-    def __init__(self, redis: Redis, client: httpx.AsyncClient, settings: Settings):
+    def __init__(self, redis: Redis, client: httpx.AsyncClient, settings: Settings, image_cache: ImageCache | None = None):
         """初始化服务，并创建使用同一 Redis/HTTP 客户端的凭证池。"""
         self.redis = redis
         self.client = client
         self.settings = settings
         self.pool = CredentialPool(redis, client, settings)
+        self.image_cache = image_cache
 
     @staticmethod
     def _conversation_key(conversation_id: str) -> str:
@@ -158,7 +160,7 @@ class LexiangService:
             if not session_id:
                 raise GatewayError(502, "QA_SESSION_MISSING", "Lexiang response did not include a session id", True)
             await self._save_conversation(conversation, request.user_id, session_id, credential.group)
-            return ChatResponse(
+            chat_response = ChatResponse(
                 conversation_id=conversation.id,
                 session_id=session_id,
                 answer=data.get("content", ""),
@@ -168,6 +170,14 @@ class LexiangService:
                 request_id=body.get("request_id"),
                 cached_token=cached_token,
             )
+            # 图片防盗链处理：下载图片到本地并替换 URL（answer 与 additional_content 可独立开关）
+            if self.image_cache:
+                chat_response = await self.image_cache.process_response(
+                    chat_response,
+                    process_answer=self.settings.image_cache_answer_enabled,
+                    process_additional=self.settings.image_cache_additional_enabled,
+                )
+            return chat_response
         raise last_error or GatewayError(503, "CREDENTIAL_POOL_UNAVAILABLE", "No usable credential", True)
 
     async def stream(self, request: ChatRequest) -> tuple[str, AsyncIterator[bytes]]:
@@ -188,10 +198,16 @@ class LexiangService:
             raise GatewayError(502, "QA_UPSTREAM_ERROR", "Lexiang AI Q&A stream could not be started", True)
 
         async def iterator() -> AsyncIterator[bytes]:
-            """逐行转发上游 SSE，同时从完成事件提取 session_id。"""
+            """逐行转发上游 SSE，同时从完成事件提取 session_id。
+
+            若启用了图片缓存，会先缓冲全部行、完成图片下载和 URL 替换后再转发，
+            确保图片地址不会被截断且防盗链图片可正常展示。
+            """
             final_session_id: str | None = None
             try:
+                buffered_lines: list[str] = []
                 async for line in upstream.aiter_lines():
+                    buffered_lines.append(line)
                     if line.startswith("data:"):
                         try:
                             event = json.loads(line[5:])
@@ -199,7 +215,18 @@ class LexiangService:
                                 final_session_id = event["session_id"]
                         except json.JSONDecodeError:
                             pass
+
+                # 图片防盗链处理：缓冲完成后统一替换 URL（answer 与 additional_content 可独立开关）
+                if self.image_cache and final_session_id is not None:
+                    buffered_lines = await self.image_cache.process_stream_lines(
+                        buffered_lines,
+                        process_answer=self.settings.image_cache_answer_enabled,
+                        process_additional=self.settings.image_cache_additional_enabled,
+                    )
+
+                for line in buffered_lines:
                     yield (line + "\n").encode()
+
                 if final_session_id:
                     await self._save_conversation(conversation, request.user_id, final_session_id, credential.group)
             finally:

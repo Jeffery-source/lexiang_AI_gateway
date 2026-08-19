@@ -9,10 +9,12 @@ import httpx
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from redis.asyncio import Redis
 
 from .config import Settings, get_settings
 from .exceptions import GatewayError
+from .image_cache import ImageCache
 from .models import ChatRequest, ChatResponse, OpenAIChatCompletionRequest
 from .openai_compat import completion_chunks, completion_payload, to_lexiang_request
 from .service import LexiangService
@@ -27,6 +29,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.redis = redis
     app.state.http = httpx.AsyncClient(timeout=settings.upstream_timeout_seconds)
     app.state.settings = settings
+    # 创建图片缓存处理器
+    if settings.image_cache_enabled:
+        app.state.image_cache = ImageCache(
+            http_client=app.state.http,
+            cache_dir=settings.image_cache_dir,
+            base_url=settings.image_base_url,
+            referer=settings.image_referer or None,
+        )
+        # 挂载静态文件路由，用于对外提供缓存的图片
+        app.mount("/images", StaticFiles(directory=settings.image_cache_dir), name="images")
+    else:
+        app.state.image_cache = None
     try:
         yield
     finally:
@@ -48,7 +62,12 @@ async def gateway_error_handler(_: Request, error: GatewayError) -> JSONResponse
 
 def get_service(request: Request) -> LexiangService:
     """从应用共享状态构造一次请求所需的乐享服务对象。"""
-    return LexiangService(request.app.state.redis, request.app.state.http, request.app.state.settings)
+    return LexiangService(
+        request.app.state.redis,
+        request.app.state.http,
+        request.app.state.settings,
+        image_cache=request.app.state.image_cache,
+    )
 
 
 async def require_api_key(
