@@ -31,6 +31,21 @@ BARE_IMG_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 引用标记：[1]、[2]、[12] 等，用于删除 answer 中的引用编号。
+# 用前后断言避免误删 markdown 链接文本 [1](url) 与图片 alt ![1](url) 语法。
+REFERENCE_MARK_RE = re.compile(r"(?<!!)\[\d+\](?!\()")
+
+
+def strip_reference_marks(text: str) -> str:
+    """删除文本中的 [数字] 引用标记。
+
+    仅删除独立出现的引用编号（如句尾的 [1]、[2]），
+    保留 markdown 链接 [1](url) 与图片 ![1](url) 不被破坏。
+    """
+    if not text:
+        return text
+    return REFERENCE_MARK_RE.sub("", text)
+
 # 下载图片时使用的请求头，绕过 Referer 防盗链
 DEFAULT_DOWNLOAD_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -200,10 +215,11 @@ class ImageCache:
         - process_answer=True：处理 answer / reasoning_content 正文中的图片
         - process_additional=True：处理 additional_content（任意嵌套结构，如
           reference_chunks[].content 中的 markdown 图片）
+        - answer 中的 [数字] 引用标记始终会被清理
         """
         if process_answer:
             if response.answer:
-                response.answer = await self.process_text(response.answer)
+                response.answer = strip_reference_marks(await self.process_text(response.answer))
             if response.reasoning_content:
                 response.reasoning_content = await self.process_text(response.reasoning_content)
         if process_additional and response.additional_content:
@@ -258,13 +274,18 @@ class ImageCache:
                 new_lines.append(line)
                 continue
             changed = False
-            if process_answer and isinstance(event.get("content"), str):
+            # 引用标记清理：只要事件带 content 就执行，与图片缓存开关无关
+            if isinstance(event.get("content"), str):
                 content = event["content"]
-                for original, local in answer_url_map.items():
-                    if original in content:
-                        content = content.replace(original, local)
-                        changed = True
-                event["content"] = content
+                if process_answer:
+                    for original, local in answer_url_map.items():
+                        if original in content:
+                            content = content.replace(original, local)
+                            changed = True
+                content = strip_reference_marks(content)
+                if content != event["content"]:
+                    event["content"] = content
+                    changed = True
             if process_additional and "additional_content" in event:
                 new_value = await self._process_value(event["additional_content"])
                 if new_value != event["additional_content"]:
